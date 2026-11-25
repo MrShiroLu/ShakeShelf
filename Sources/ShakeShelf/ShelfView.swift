@@ -248,6 +248,8 @@ private final class FileGridView: NSView {
     private var items: [URL] = []
     private var selection = Set<URL>()
     private var tiles: [URL: FileTileView] = [:]
+    /// Folder names shown under files whose name appears more than once on the shelf.
+    private var folderLabels: [URL: String] = [:]
     private var configure: ((FileTileView, URL) -> Void)?
     private var columns = 1
     private var tileWidth: CGFloat = 0
@@ -273,7 +275,30 @@ private final class FileGridView: NSView {
         self.items = items
         self.selection = selection
         self.configure = configure
+        folderLabels = Self.folderLabels(for: items)
         refreshTiles()
+    }
+
+    /// For files that share a name, picks the shortest trailing part of their folder paths
+    /// that tells them apart, like "Downloads" or "Work/Downloads".
+    private static func folderLabels(for items: [URL]) -> [URL: String] {
+        var labels: [URL: String] = [:]
+        for group in Dictionary(grouping: items, by: \.lastPathComponent).values where group.count > 1 {
+            let folders = group.map { Array($0.deletingLastPathComponent().pathComponents.dropFirst()) }
+            for (index, folder) in folders.enumerated() {
+                let others = folders.indices.filter { $0 != index }.map { folders[$0] }
+                // Each file gets only as much of its path as it needs, so "Desktop" stays
+                // short even when two "Downloads" folders need their parents.
+                var depth = 1
+                while depth < folder.count,
+                      others.contains(where: { $0.suffix(depth) == folder.suffix(depth) }) {
+                    depth += 1
+                }
+                let label = folder.suffix(depth).joined(separator: "/")
+                labels[group[index]] = label.isEmpty ? "/" : label
+            }
+        }
+        return labels
     }
 
     func preview(for url: URL) -> NSImage? {
@@ -320,6 +345,7 @@ private final class FileGridView: NSView {
                 return tile
             }()
             tile.isSelected = selection.contains(url)
+            tile.folder = folderLabels[url]
             let x = Self.padding + CGFloat(index % columns) * (tileWidth + Self.gap)
             let y = Self.padding + CGFloat(index / columns) * rowHeight
             tile.frame = backingAlignedRect(
@@ -354,6 +380,7 @@ private final class FileTileView: NSView {
     private static let inset: CGFloat = 8
     private static let labelGap: CGFloat = 2
     private static let labelFont = NSFont.systemFont(ofSize: 12)
+    private static let folderFont = NSFont.systemFont(ofSize: 10)
     /// Two lines, like Finder's icon view.
     private static let labelHeight: CGFloat = ceil(labelFont.boundingRectForFont.height * 2)
     private static let removeSize: CGFloat = 20
@@ -366,6 +393,14 @@ private final class FileTileView: NSView {
     var isSelected = false {
         didSet { updateAppearance() }
     }
+    /// Shown on a second line when another file on the shelf has the same name.
+    var folder: String? {
+        didSet {
+            guard folder != oldValue else { return }
+            updateLabel()
+            needsLayout = true
+        }
+    }
 
     var preview: NSImage? { imageView.image }
 
@@ -374,6 +409,7 @@ private final class FileTileView: NSView {
     private let labelBackground = NSView()
     private let thumbnails: NSCache<NSURL, NSImage>
     private var thumbnailRequest: QLThumbnailGenerator.Request?
+    private let name: String
     private let nameLabel: NSTextField
     private let removeButton: FirstMouseButton
     private var isHovered = false {
@@ -387,7 +423,8 @@ private final class FileTileView: NSView {
 
     init(url: URL, thumbnails: NSCache<NSURL, NSImage>) {
         self.thumbnails = thumbnails
-        nameLabel = NSTextField(wrappingLabelWithString: url.lastPathComponent)
+        name = url.lastPathComponent
+        nameLabel = NSTextField(wrappingLabelWithString: name)
         removeButton = FirstMouseButton(
             image: NSImage(systemSymbolName: "xmark.circle.fill", accessibilityDescription: "Remove") ?? NSImage(),
             target: nil,
@@ -498,7 +535,7 @@ private final class FileTileView: NSView {
 
     private func updateAppearance() {
         removeButton.isHidden = !isHovered
-        nameLabel.textColor = isSelected ? .alternateSelectedControlTextColor : .labelColor
+        updateLabel()
         effectiveAppearance.performAsCurrentDrawingAppearance {
             // Label colors resolve oddly on a vibrant background, so the box is a plain tint.
             let isDark = effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
@@ -508,6 +545,37 @@ private final class FileTileView: NSView {
                 ? NSColor.selectedContentBackgroundColor.cgColor
                 : NSColor.clear.cgColor
         }
+    }
+
+    private func updateLabel() {
+        let color: NSColor = isSelected ? .alternateSelectedControlTextColor : .labelColor
+        guard let folder else {
+            nameLabel.attributedStringValue = NSAttributedString(string: name, attributes: [
+                .font: Self.labelFont,
+                .foregroundColor: color,
+                .paragraphStyle: Self.paragraph(.byWordWrapping),
+            ])
+            return
+        }
+        // One line each, so a long name can't push the folder out of the two-line label.
+        let text = NSMutableAttributedString(string: name + "\n", attributes: [
+            .font: Self.labelFont,
+            .foregroundColor: color,
+            .paragraphStyle: Self.paragraph(.byTruncatingMiddle),
+        ])
+        text.append(NSAttributedString(string: folder, attributes: [
+            .font: Self.folderFont,
+            .foregroundColor: isSelected ? color.withAlphaComponent(0.8) : .secondaryLabelColor,
+            .paragraphStyle: Self.paragraph(.byTruncatingHead),
+        ]))
+        nameLabel.attributedStringValue = text
+    }
+
+    private static func paragraph(_ lineBreakMode: NSLineBreakMode) -> NSParagraphStyle {
+        let style = NSMutableParagraphStyle()
+        style.alignment = .center
+        style.lineBreakMode = lineBreakMode
+        return style
     }
 
     func cancelThumbnail() {
